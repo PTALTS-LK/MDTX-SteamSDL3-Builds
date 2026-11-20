@@ -125,6 +125,8 @@ jobs:
       - name: Build SDL3 Steam
         if: steps.source.outputs.should_build == 'true'
         working-directory: mdtx/work
+        env:
+          JITPACK: "true"
         run: |
           gradle \
             -Pbuildversion="${RELEASE_VERSION}" \
