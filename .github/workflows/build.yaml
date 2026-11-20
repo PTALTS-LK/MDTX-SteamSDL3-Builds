@@ -1,9 +1,8 @@
 name: MDTX SDL3 Steam Build
 
 on:
-  # 每 30 分钟轮询一次
-  schedule:
-    - cron: "13,43 * * * *"
+schedule:
+  - cron: "17 */4 * * *"
 
   # 手动触发
   workflow_dispatch:
