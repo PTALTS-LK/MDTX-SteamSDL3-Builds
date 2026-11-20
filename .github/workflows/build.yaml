@@ -1,0 +1,211 @@
+name: MDTX SDL3 Steam Build
+
+on:
+  # 每 30 分钟轮询一次
+  schedule:
+    - cron: "13,43 * * * *"
+
+  # 手动触发
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Build even if upstream has not changed"
+        type: boolean
+        required: false
+        default: true
+
+# 更新构建状态文件需要 contents: write
+permissions:
+  contents: write
+
+# 同一时间只允许一个构建任务运行
+concurrency:
+  group: mdtx-sdl3-steam-build
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      # 1. Checkout 构建控制仓库
+      - name: Checkout Build Repository
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+
+      # 2. Git 身份配置
+      - name: Configure Git
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      # 3. 下载上游根仓库并检查 SHA
+      - name: Check Upstream
+        id: source
+        env:
+          FORCE_BUILD: ${{ github.event_name == 'workflow_dispatch' && inputs.force }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git clone \
+            --depth 1 \
+            --branch main \
+            https://github.com/TinyLake/MindustryX.git \
+            mdtx
+
+          UPSTREAM_SHA=$(git -C mdtx rev-parse HEAD)
+          SHORT_SHA="${UPSTREAM_SHA:0:12}"
+
+          STATE_FILE=".build-state/last-successful-upstream-sha"
+          LAST_SHA=""
+
+          if [[ -f "$STATE_FILE" ]]; then
+            LAST_SHA=$(cat "$STATE_FILE")
+          fi
+
+          echo "Upstream SHA: $UPSTREAM_SHA"
+          echo "Last SHA:     ${LAST_SHA:-none}"
+
+          echo "sha=$UPSTREAM_SHA" >> "$GITHUB_OUTPUT"
+          echo "short_sha=$SHORT_SHA" >> "$GITHUB_OUTPUT"
+
+          if [[ "$FORCE_BUILD" == "true" || "$UPSTREAM_SHA" != "$LAST_SHA" ]]; then
+            echo "New source or forced build."
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No upstream changes. Skipping build."
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # 4. 配置 Java
+      - name: Set up JDK 17
+        if: steps.source.outputs.should_build == 'true'
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 17
+
+      # 5. 配置 Gradle
+      - name: Setup Gradle
+        if: steps.source.outputs.should_build == 'true'
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          gradle-version: 8.12
+
+      # 6. 初始化 Submodules 并应用 MDTX Patch
+      - name: Prepare Sources
+        if: steps.source.outputs.should_build == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd mdtx
+
+          git submodule sync --recursive
+
+          git submodule update \
+            --init \
+            --recursive \
+            --depth=10
+
+          # 补丁冲突时自动 Abort，禁止交互式等待
+          printf 'a\n' | bash ./scripts/applyPatches.sh
+
+      # 7. 设置构建版本
+      - name: Set Build Version
+        if: steps.source.outputs.should_build == 'true'
+        run: |
+          RELEASE_VERSION=$(date -u +'%Y.%m').X${GITHUB_RUN_NUMBER}
+          echo "RELEASE_VERSION=$RELEASE_VERSION" >> "$GITHUB_ENV"
+
+      # 8. 构建 SDL3 + Steam 版本
+      - name: Build SDL3 Steam
+        if: steps.source.outputs.should_build == 'true'
+        working-directory: mdtx/work
+        run: |
+          gradle \
+            -Pbuildversion="${RELEASE_VERSION}" \
+            -Prelease \
+            -PversionModifier=steam \
+            --parallel \
+            desktop:distSdl3
+
+      # 9. 检查产物和 Steam 原生库
+      - name: Verify Build
+        if: steps.source.outputs.should_build == 'true'
+        working-directory: mdtx/work
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          JAR="desktop/build/libs/Mindustry-SDL3.jar"
+
+          test -s "$JAR"
+
+          if ! jar tf "$JAR" | grep -Eiq 'steam_api|frogworks'; then
+            echo "Steam native libraries were not found in the SDL3 JAR."
+            exit 1
+          fi
+
+          echo "SDL3 JAR and Steam native libraries verified."
+
+      # 10. 整理构建产物
+      - name: Package Artifact
+        if: steps.source.outputs.should_build == 'true'
+        env:
+          UPSTREAM_SHA: ${{ steps.source.outputs.sha }}
+          SHORT_SHA: ${{ steps.source.outputs.short_sha }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p build-output
+
+          cp \
+            mdtx/work/desktop/build/libs/Mindustry-SDL3.jar \
+            "build-output/MDTX-SDL3-Steam-${RELEASE_VERSION}-${SHORT_SHA}.jar"
+
+          cat > build-output/build-info.txt <<EOF
+          Repository: https://github.com/TinyLake/MindustryX
+          Branch: main
+          Commit: ${UPSTREAM_SHA}
+          Build version: ${RELEASE_VERSION}
+          Build task: desktop:distSdl3
+          Version modifier: steam
+          EOF
+
+      # 11. 上传 Artifact
+      - name: Upload Artifact
+        if: steps.source.outputs.should_build == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: MDTX-SDL3-Steam-${{ steps.source.outputs.short_sha }}
+          path: build-output/*
+          if-no-files-found: error
+          retention-days: 30
+
+      # 12. 构建成功后记录 SHA
+      - name: Save Successful Build SHA
+        if: steps.source.outputs.should_build == 'true'
+        env:
+          UPSTREAM_SHA: ${{ steps.source.outputs.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p .build-state
+
+          printf '%s\n' "$UPSTREAM_SHA" \
+            > .build-state/last-successful-upstream-sha
+
+          git add .build-state/last-successful-upstream-sha
+
+          if ! git diff --cached --quiet; then
+            git commit \
+              -m "ci: record successful MDTX build ${UPSTREAM_SHA:0:12}"
+
+            git push origin HEAD:main
+          fi
