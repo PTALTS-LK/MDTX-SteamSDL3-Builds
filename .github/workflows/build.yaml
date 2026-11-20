@@ -1,3 +1,4 @@
+
 name: MDTX SDL3 Steam Build
 
 on:
@@ -59,11 +60,15 @@ jobs:
           UPSTREAM_SHA=$(git -C mdtx rev-parse HEAD)
           SHORT_SHA="${UPSTREAM_SHA:0:12}"
 
-          STATE_FILE=".build-state/last-successful-upstream-sha"
+          # 从独立状态分支读取上次成功构建的 SHA
           LAST_SHA=""
 
-          if [[ -f "$STATE_FILE" ]]; then
-            LAST_SHA=$(cat "$STATE_FILE")
+          if git ls-remote --exit-code --heads origin upstream-status >/dev/null 2>&1; then
+            git fetch origin upstream-status
+
+            LAST_SHA=$(git show \
+              origin/upstream-status:.build-state/last-successful-upstream-sha \
+              2>/dev/null || true)
           fi
 
           echo "Upstream SHA: $UPSTREAM_SHA"
@@ -188,7 +193,7 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-      # 12. 构建成功后记录 SHA
+      # 12. 构建成功后，将 SHA 保存到独立 upstream-status 分支
       - name: Save Successful Build SHA
         if: steps.source.outputs.should_build == 'true'
         env:
@@ -197,16 +202,46 @@ jobs:
         run: |
           set -euo pipefail
 
-          mkdir -p .build-state
+          STATUS_DIR="$RUNNER_TEMP/upstream-status"
+
+          # 检查远程状态分支是否存在
+          if git ls-remote --exit-code --heads origin upstream-status >/dev/null 2>&1; then
+            echo "Existing upstream-status branch found."
+
+            git fetch origin upstream-status
+
+            git worktree add \
+              -B upstream-status \
+              "$STATUS_DIR" \
+              origin/upstream-status
+          else
+            echo "Creating orphan upstream-status branch."
+
+            git worktree add --detach "$STATUS_DIR" HEAD
+
+            git -C "$STATUS_DIR" switch --orphan upstream-status
+          fi
+
+          # 配置 Git 身份
+          git -C "$STATUS_DIR" config user.name "github-actions[bot]"
+          git -C "$STATUS_DIR" config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # 更新状态文件
+          mkdir -p "$STATUS_DIR/.build-state"
 
           printf '%s\n' "$UPSTREAM_SHA" \
-            > .build-state/last-successful-upstream-sha
+            > "$STATUS_DIR/.build-state/last-successful-upstream-sha"
 
-          git add .build-state/last-successful-upstream-sha
+          git -C "$STATUS_DIR" add .build-state/last-successful-upstream-sha
 
-          if ! git diff --cached --quiet; then
-            git commit \
-              -m "ci: record successful MDTX build ${UPSTREAM_SHA:0:12}"
+          # 仅在状态发生变化时提交
+          if ! git -C "$STATUS_DIR" diff --cached --quiet; then
+            git -C "$STATUS_DIR" commit \
+              -m "ci: update successful upstream SHA ${UPSTREAM_SHA:0:12}"
 
-            git push origin HEAD:main
+            git -C "$STATUS_DIR" push origin HEAD:refs/heads/upstream-status
+
+            echo "Successfully updated upstream-status."
+          else
+            echo "Upstream SHA unchanged. No commit needed."
           fi
